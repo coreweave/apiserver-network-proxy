@@ -1,3 +1,19 @@
+/*
+Copyright 2022 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package app
 
 import (
@@ -5,17 +21,18 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
-	"net/http/pprof"
+	netpprof "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strings"
+	runpprof "runtime/pprof"
+	"strconv"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
@@ -35,12 +52,15 @@ import (
 
 var udsListenerLock sync.Mutex
 
+const ReadHeaderTimeout = 60 * time.Second
+
 func NewProxyCommand(p *Proxy, o *options.ProxyRunOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:  "proxy",
 		Long: `A gRPC proxy server, receives requests from the API server and forwards to the agent.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return p.run(o)
+			stopCh := SetupSignalHandler()
+			return p.Run(o, stopCh)
 		},
 	}
 
@@ -62,11 +82,16 @@ func tlsCipherSuites(cipherNames []string) []uint16 {
 }
 
 type Proxy struct {
+	agentServer  *grpc.Server
+	adminServer  *http.Server
+	healthServer *http.Server
+
+	server *server.ProxyServer
 }
 
 type StopFunc func()
 
-func (p *Proxy) run(o *options.ProxyRunOptions) error {
+func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	o.Print()
 	if err := o.Validate(); err != nil {
 		return fmt.Errorf("failed to validate server options with %v", err)
@@ -103,40 +128,43 @@ func (p *Proxy) run(o *options.ProxyRunOptions) error {
 		AuthenticationAudience: o.AuthenticationAudience,
 	}
 	klog.V(1).Infoln("Starting frontend server for client connections.")
-	ps, err := server.GenProxyStrategiesFromStr(o.ProxyStrategies)
+	ps, err := server.ParseProxyStrategies(o.ProxyStrategies)
 	if err != nil {
 		return err
 	}
-	server := server.NewProxyServer(o.ServerID, ps, int(o.ServerCount), authOpt, o.WarnOnChannelLimit)
+	p.server = server.NewProxyServer(o.ServerID, ps, int(o.ServerCount), authOpt, o.XrfChannelSize)
 
-	frontendStop, err := p.runFrontendServer(ctx, o, server)
+	frontendStop, err := p.runFrontendServer(ctx, o, p.server)
 	if err != nil {
 		return fmt.Errorf("failed to run the frontend server: %v", err)
 	}
+	if frontendStop != nil {
+		defer frontendStop()
+	}
 
 	klog.V(1).Infoln("Starting agent server for tunnel connections.")
-	err = p.runAgentServer(o, server)
+	err = p.runAgentServer(o, p.server)
 	if err != nil {
 		return fmt.Errorf("failed to run the agent server: %v", err)
 	}
+	defer p.agentServer.Stop()
+
 	klog.V(1).Infoln("Starting admin server for debug connections.")
-	err = p.runAdminServer(o, server)
+	err = p.runAdminServer(o, p.server)
 	if err != nil {
 		return fmt.Errorf("failed to run the admin server: %v", err)
 	}
+	defer p.adminServer.Close()
+
 	klog.V(1).Infoln("Starting health server for healthchecks.")
-	err = p.runHealthServer(o, server)
+	err = p.runHealthServer(o, p.server)
 	if err != nil {
 		return fmt.Errorf("failed to run the health server: %v", err)
 	}
+	defer p.healthServer.Close()
 
-	stopCh := SetupSignalHandler()
 	<-stopCh
 	klog.V(1).Infoln("Shutting down server.")
-
-	if frontendStop != nil {
-		frontendStop()
-	}
 
 	return nil
 }
@@ -147,14 +175,19 @@ func SetupSignalHandler() (stopCh <-chan struct{}) {
 	stop := make(chan struct{})
 	c := make(chan os.Signal, 2)
 	signal.Notify(c, shutdownSignals...)
-	go func() {
-		<-c
-		close(stop)
-		<-c
-		os.Exit(1) // second signal. Exit directly.
-	}()
+	labels := runpprof.Labels(
+		"core", "signalHandler",
+	)
+	go runpprof.Do(context.Background(), labels, func(context.Context) { handleSignals(c, stop) })
 
 	return stop
+}
+
+func handleSignals(signalCh chan os.Signal, stopCh chan struct{}) {
+	<-signalCh
+	close(stopCh)
+	<-signalCh
+	os.Exit(1) // second signal. Exit directly.
 }
 
 func getUDSListener(ctx context.Context, udsName string) (net.Listener, error) {
@@ -194,11 +227,16 @@ func (p *Proxy) runUDSFrontendServer(ctx context.Context, o *options.ProxyRunOpt
 		if err != nil {
 			return nil, fmt.Errorf("failed to get uds listener: %v", err)
 		}
-		go grpcServer.Serve(lis)
+		labels := runpprof.Labels(
+			"core", "udsGrpcFrontend",
+			"udsFile", o.UdsName,
+		)
+		go runpprof.Do(context.Background(), labels, func(context.Context) { grpcServer.Serve(lis) })
 		stop = grpcServer.GracefulStop
 	} else {
 		// http-connect
 		server := &http.Server{
+			ReadHeaderTimeout: ReadHeaderTimeout,
 			Handler: &server.Tunnel{
 				Server: s,
 			},
@@ -207,7 +245,11 @@ func (p *Proxy) runUDSFrontendServer(ctx context.Context, o *options.ProxyRunOpt
 			err := server.Shutdown(ctx)
 			klog.ErrorS(err, "error shutting down server")
 		}
-		go func() {
+		labels := runpprof.Labels(
+			"core", "udsHttpFrontend",
+			"udsFile", o.UdsName,
+		)
+		go runpprof.Do(context.Background(), labels, func(context.Context) {
 			udsListener, err := getUDSListener(ctx, o.UdsName)
 			if err != nil {
 				klog.ErrorS(err, "failed to get uds listener")
@@ -220,26 +262,26 @@ func (p *Proxy) runUDSFrontendServer(ctx context.Context, o *options.ProxyRunOpt
 			if err != nil {
 				klog.ErrorS(err, "failed to serve uds requests")
 			}
-		}()
+		})
 	}
 
 	return stop, nil
 }
 
-func (p *Proxy) getTLSConfig(caFile, certFile, keyFile, cipherSuites string) (*tls.Config, error) {
+func (p *Proxy) getTLSConfig(caFile, certFile, keyFile string, cipherSuites []string) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load X509 key pair %s and %s: %v", certFile, keyFile, err)
 	}
 
-	cipherSuiteIDs := tlsCipherSuites(strings.Split(cipherSuites, ","))
+	cipherSuiteIDs := tlsCipherSuites(cipherSuites)
 
 	if caFile == "" {
 		return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12, CipherSuites: cipherSuiteIDs}, nil
 	}
 
 	certPool := x509.NewCertPool()
-	caCert, err := ioutil.ReadFile(filepath.Clean(caFile))
+	caCert, err := os.ReadFile(filepath.Clean(caFile))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read cluster CA cert %s: %v", caFile, err)
 	}
@@ -268,7 +310,7 @@ func (p *Proxy) runMTLSFrontendServer(ctx context.Context, o *options.ProxyRunOp
 		return nil, err
 	}
 
-	addr := fmt.Sprintf(":%d", o.ServerPort)
+	addr := net.JoinHostPort(o.ServerBindAddress, strconv.Itoa(o.ServerPort))
 
 	if o.Mode == "grpc" {
 		frontendServerOptions := []grpc.ServerOption{
@@ -281,13 +323,18 @@ func (p *Proxy) runMTLSFrontendServer(ctx context.Context, o *options.ProxyRunOp
 		if err != nil {
 			return nil, fmt.Errorf("failed to listen on %s: %v", addr, err)
 		}
-		go grpcServer.Serve(lis)
+		labels := runpprof.Labels(
+			"core", "mtlsGrpcFrontend",
+			"port", strconv.FormatUint(uint64(o.ServerPort), 10),
+		)
+		go runpprof.Do(context.Background(), labels, func(context.Context) { grpcServer.Serve(lis) })
 		stop = grpcServer.GracefulStop
 	} else {
 		// http-connect
 		server := &http.Server{
-			Addr:      addr,
-			TLSConfig: tlsConfig,
+			ReadHeaderTimeout: ReadHeaderTimeout,
+			Addr:              addr,
+			TLSConfig:         tlsConfig,
 			Handler: &server.Tunnel{
 				Server: s,
 			},
@@ -299,12 +346,16 @@ func (p *Proxy) runMTLSFrontendServer(ctx context.Context, o *options.ProxyRunOp
 				klog.ErrorS(err, "failed to shutdown server")
 			}
 		}
-		go func() {
+		labels := runpprof.Labels(
+			"core", "mtlsHttpFrontend",
+			"port", strconv.FormatUint(uint64(o.ServerPort), 10),
+		)
+		go runpprof.Do(context.Background(), labels, func(context.Context) {
 			err := server.ListenAndServeTLS("", "") // empty files defaults to tlsConfig
 			if err != nil {
 				klog.ErrorS(err, "failed to listen on frontend port")
 			}
-		}()
+		})
 	}
 
 	return stop, nil
@@ -317,10 +368,14 @@ func (p *Proxy) runAgentServer(o *options.ProxyRunOptions, server *server.ProxyS
 		return err
 	}
 
-	addr := fmt.Sprintf(":%d", o.AgentPort)
+	addr := net.JoinHostPort(o.AgentBindAddress, strconv.Itoa(o.AgentPort))
 	agentServerOptions := []grpc.ServerOption{
 		grpc.Creds(credentials.NewTLS(tlsConfig)),
 		grpc.KeepaliveParams(keepalive.ServerParameters{Time: o.KeepaliveTime}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             30 * time.Second,
+			PermitWithoutStream: true,
+		}),
 	}
 	grpcServer := grpc.NewServer(agentServerOptions...)
 	agent.RegisterAgentServiceServer(grpcServer, server)
@@ -328,34 +383,47 @@ func (p *Proxy) runAgentServer(o *options.ProxyRunOptions, server *server.ProxyS
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %v", addr, err)
 	}
-	go grpcServer.Serve(lis)
+	labels := runpprof.Labels(
+		"core", "agentListener",
+		"port", strconv.FormatUint(uint64(o.AgentPort), 10),
+	)
+	go runpprof.Do(context.Background(), labels, func(context.Context) { grpcServer.Serve(lis) })
+	p.agentServer = grpcServer
 
 	return nil
 }
 
-func (p *Proxy) runAdminServer(o *options.ProxyRunOptions, server *server.ProxyServer) error {
+func (p *Proxy) runAdminServer(o *options.ProxyRunOptions, _ *server.ProxyServer) error {
 	muxHandler := http.NewServeMux()
 	muxHandler.Handle("/metrics", promhttp.Handler())
 	if o.EnableProfiling {
 		muxHandler.HandleFunc("/debug/pprof", util.RedirectTo("/debug/pprof/"))
-		muxHandler.HandleFunc("/debug/pprof/", pprof.Index)
+		muxHandler.HandleFunc("/debug/pprof/", netpprof.Index)
+		muxHandler.HandleFunc("/debug/pprof/profile", netpprof.Profile)
+		muxHandler.HandleFunc("/debug/pprof/symbol", netpprof.Symbol)
+		muxHandler.HandleFunc("/debug/pprof/trace", netpprof.Trace)
 		if o.EnableContentionProfiling {
 			runtime.SetBlockProfileRate(1)
 		}
 	}
-	adminServer := &http.Server{
-		Addr:           fmt.Sprintf("127.0.0.1:%d", o.AdminPort),
-		Handler:        muxHandler,
-		MaxHeaderBytes: 1 << 20,
+	p.adminServer = &http.Server{
+		Addr:              net.JoinHostPort(o.AdminBindAddress, strconv.Itoa(o.AdminPort)),
+		Handler:           muxHandler,
+		MaxHeaderBytes:    1 << 20,
+		ReadHeaderTimeout: ReadHeaderTimeout,
 	}
 
-	go func() {
-		err := adminServer.ListenAndServe()
+	labels := runpprof.Labels(
+		"core", "adminListener",
+		"port", strconv.FormatUint(uint64(o.AdminPort), 10),
+	)
+	go runpprof.Do(context.Background(), labels, func(context.Context) {
+		err := p.adminServer.ListenAndServe()
 		if err != nil {
 			klog.ErrorS(err, "admin server could not listen")
 		}
 		klog.V(1).Infoln("Admin server stopped listening")
-	}()
+	})
 
 	return nil
 }
@@ -380,19 +448,29 @@ func (p *Proxy) runHealthServer(o *options.ProxyRunOptions, server *server.Proxy
 	// "/ready" is deprecated but being maintained for backward compatibility
 	muxHandler.HandleFunc("/ready", readinessHandler)
 	muxHandler.HandleFunc("/readyz", readinessHandler)
-	healthServer := &http.Server{
-		Addr:           fmt.Sprintf(":%d", o.HealthPort),
-		Handler:        muxHandler,
-		MaxHeaderBytes: 1 << 20,
+	p.healthServer = &http.Server{
+		Addr:              net.JoinHostPort(o.HealthBindAddress, strconv.Itoa(o.HealthPort)),
+		Handler:           muxHandler,
+		MaxHeaderBytes:    1 << 20,
+		ReadHeaderTimeout: ReadHeaderTimeout,
 	}
 
-	go func() {
-		err := healthServer.ListenAndServe()
+	labels := runpprof.Labels(
+		"core", "healthListener",
+		"port", strconv.FormatUint(uint64(o.HealthPort), 10),
+	)
+	go runpprof.Do(context.Background(), labels, func(context.Context) {
+		err := p.healthServer.ListenAndServe()
 		if err != nil {
 			klog.ErrorS(err, "health server could not listen")
 		}
 		klog.V(1).Infoln("Health server stopped listening")
-	}()
+	})
 
 	return nil
+}
+
+// ProxyServer exposes internal state for testing.
+func (p *Proxy) ProxyServer() *server.ProxyServer {
+	return p.server
 }

@@ -17,7 +17,9 @@ limitations under the License.
 package agent
 
 import (
+	"context"
 	"math"
+	runpprof "runtime/pprof"
 	"sync"
 	"time"
 
@@ -25,6 +27,7 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/agent/metrics"
 )
 
 // ClientSet consists of clients connected to each instance of an HA proxy server.
@@ -49,6 +52,8 @@ type ClientSet struct {
 	dialOptions []grpc.DialOption
 	// file path contains service account token
 	serviceAccountTokenPath string
+	// channel to signal that the agent is pending termination.
+	drainCh <-chan struct{}
 	// channel to signal shutting down the client set. Primarily for test.
 	stopCh <-chan struct{}
 
@@ -56,6 +61,7 @@ type ClientSet struct {
 	// by the server when choosing agent
 
 	warnOnChannelLimit bool
+	xfrChannelSize     int
 
 	syncForever bool // Continue syncing (support dynamic server count).
 }
@@ -103,6 +109,7 @@ func (cs *ClientSet) addClientLocked(serverID string, c *Client) error {
 		return &DuplicateServerError{ServerID: serverID}
 	}
 	cs.clients[serverID] = c
+	metrics.Metrics.SetServerConnectionsCount(len(cs.clients))
 	return nil
 
 }
@@ -121,6 +128,7 @@ func (cs *ClientSet) RemoveClient(serverID string) {
 	}
 	cs.clients[serverID].Close()
 	delete(cs.clients, serverID)
+	metrics.Metrics.SetServerConnectionsCount(len(cs.clients))
 }
 
 type ClientSetConfig struct {
@@ -134,9 +142,10 @@ type ClientSetConfig struct {
 	ServiceAccountTokenPath string
 	WarnOnChannelLimit      bool
 	SyncForever             bool
+	XrfChannelSize          int
 }
 
-func (cc *ClientSetConfig) NewAgentClientSet(stopCh <-chan struct{}) *ClientSet {
+func (cc *ClientSetConfig) NewAgentClientSet(drainCh, stopCh <-chan struct{}) *ClientSet {
 	return &ClientSet{
 		clients:                 make(map[string]*Client),
 		agentID:                 cc.AgentID,
@@ -149,6 +158,8 @@ func (cc *ClientSetConfig) NewAgentClientSet(stopCh <-chan struct{}) *ClientSet 
 		serviceAccountTokenPath: cc.ServiceAccountTokenPath,
 		warnOnChannelLimit:      cc.WarnOnChannelLimit,
 		syncForever:             cc.SyncForever,
+		drainCh:                 drainCh,
+		xfrChannelSize:          cc.XrfChannelSize,
 		stopCh:                  stopCh,
 	}
 }
@@ -211,21 +222,26 @@ func (cs *ClientSet) connectOnce() error {
 	}
 	cs.serverCount = serverCount
 	if err := cs.AddClient(c.serverID, c); err != nil {
-		if dse, ok := err.(*DuplicateServerError); ok {
-			klog.V(4).InfoS("closing connection to duplicate server", "serverID", dse.ServerID)
-		} else {
-			klog.ErrorS(err, "closing connection failure when adding a client")
-		}
 		c.Close()
 		return err
 	}
 	klog.V(2).InfoS("sync added client connecting to proxy server", "serverID", c.serverID)
-	go c.Serve()
+
+	labels := runpprof.Labels(
+		"agentIdentifiers", cs.agentIdentifiers,
+		"serverAddress", cs.address,
+		"serverID", c.serverID,
+	)
+	go runpprof.Do(context.Background(), labels, func(context.Context) { c.Serve() })
 	return nil
 }
 
 func (cs *ClientSet) Serve() {
-	go cs.sync()
+	labels := runpprof.Labels(
+		"agentIdentifiers", cs.agentIdentifiers,
+		"serverAddress", cs.address,
+	)
+	go runpprof.Do(context.Background(), labels, func(context.Context) { cs.sync() })
 }
 
 func (cs *ClientSet) shutdown() {
