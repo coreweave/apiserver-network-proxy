@@ -4,6 +4,7 @@
 name: CI/CD Pipeline
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -64,11 +65,18 @@ jobs:
           version: latest
           args: --verbose
 
+  print_info:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print the event name
+        run: |
+          echo "The workflow was triggered by a: ${{ github.event_name }}"
+
   docker-build-push:
     name: Build and Push Docker Image
     needs: [govulncheck, golangci-lint]
     # Only run on pushes to main branch or tags (not PRs)
-    if: github.event_name != 'pull_request'
+    #if: github.event_name != 'pull_request'
 
     # Required permissions for OIDC authentication
     permissions:
@@ -99,7 +107,7 @@ jobs:
 #      -t ${AGENT_FULL_IMAGE}-$(TARGETARCH):${TAG}  # set via plugin
 
       buildx-args: |
-        --platform linux/amd64
+        --platform linux/amd64,linux/arm64
         --sbom=true
         --GO_TOOLCHAIN=golang
         --GO_VERSION=1.24.3
