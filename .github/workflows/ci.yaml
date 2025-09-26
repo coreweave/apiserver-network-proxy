@@ -28,6 +28,7 @@ permissions:
   checks: write
   packages: write
   security-events: write
+  id-token: write
 
 jobs:
   govulncheck:
@@ -84,7 +85,7 @@ jobs:
       id-token: write
       packages: write
 
-    uses: coreweave/actions/.github/workflows/build-and-push-image.yml@workflows-v2.24.0
+    uses: coreweave/actions/.github/workflows/build-and-push-image.yml@workflows-v2.4.0
     secrets: inherit
     with:
       context: ./
