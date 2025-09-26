@@ -6,7 +6,7 @@ name: CI/CD Pipeline
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, dfoehr/add-k-agent-ci]
     paths:
       - 'cmd/**'
       - 'konnectivity-client/**'
@@ -15,7 +15,7 @@ on:
     tags:
       - 'v*.*.*'
   pull_request:
-    branches: [main]
+    branches: [main, dfoehr/add-k-agent-ci]
     paths:
       - 'cmd/**'
       - 'konnectivity-client/**'
