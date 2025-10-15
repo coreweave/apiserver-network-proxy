@@ -31,10 +31,18 @@
         - name: Set up Docker Buildx
           uses: docker/setup-buildx-action@v3.11.1
 
+        - name: Set image tag
+          run: |
+            git remote add upstream https://github.com/kubernetes-sigs/apiserver-network-proxy.git
+            git fetch --tags upstream
+            echo "VERSION=$(git describe --tags  --abbrev=0  --match 'v*')" >> $GITHUB_ENV
+
         - name: Build images
           run: |
-            make docker-build-all REGISTRY=ghcr.io/${{ github.repository }}
+            # TODO: how to add tag in make file
+            make docker-build-all REGISTRY=ghcr.io/${{ github.repository }} TAG=${{ env.VERSION }}-${GITHUB_SHA::7}
 
         - name: Push images
           run: |
-            make docker-push-all REGISTRY=ghcr.io/${{ github.repository }}
+            echo "using tag: ${{ env.VERSION }}"
+            make docker-push-all REGISTRY=ghcr.io/${{ github.repository }} TAG=${{ env.VERSION }}-${GITHUB_SHA::7}
