@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -90,6 +91,8 @@ const (
 	ModeHTTPConnect = "http-connect"
 )
 
+// represents a single long lived request/connection via a backend/k-agent
+// - many ProxyClientConnection are multiplexed over the same backend.conn (the actual grpc stream)
 type ProxyClientConnection struct {
 	Mode        string
 	HTTP        io.ReadWriter
@@ -102,6 +105,7 @@ type ProxyClientConnection struct {
 	start       time.Time
 	backend     *Backend
 	dialAddress string // cached for logging
+	flow        *semaphore.Weighted
 }
 
 const (
@@ -166,6 +170,8 @@ func (c *ProxyClientConnection) send(pkt *client.Packet) error {
 		} else if pkt.Type == client.PacketType_DIAL_CLS {
 			return c.CloseHTTP()
 		} else if pkt.Type == client.PacketType_DATA {
+			// TODO: we could implement a server side buffered channel (otherwise this will block if the tcp buffer to the API server is full)
+			// - but this is also just a temporary buffer/no-flow control similar to the xfr channel
 			_, err := c.HTTP.Write(pkt.GetData().Data)
 			return err
 		} else if pkt.Type == client.PacketType_DIAL_RSP {
@@ -298,6 +304,21 @@ func genContext(proxyStrategies []proxystrategies.ProxyStrategy, reqHost string)
 		}
 	}
 	return ctx
+}
+
+// getEstablishedConnection returns the ProxyClientConnection associated with the given agentID and connID.
+// Returns nil if the connection is not found.
+func (s *ProxyServer) getEstablishedConnection(agentID string, connID int64) *ProxyClientConnection {
+	connIDToConnection, exists := s.established[agentID]
+	if !exists {
+		return nil
+	}
+
+	connection, exists := connIDToConnection[connID]
+	if !exists {
+		return nil
+	}
+	return connection
 }
 
 func (s *ProxyServer) getBackend(reqHost string) (*Backend, error) {
@@ -540,6 +561,8 @@ func (s *ProxyServer) readFrontendToChannel(frontend *GrpcFrontend, userAgent []
 	}
 }
 
+// GRPC server (apiserver -> frontend) per-connection read from recvCh
+// - equivalent to tunnel.go handling single HTTPConnect connection
 func (s *ProxyServer) serveRecvFrontend(frontend *GrpcFrontend, recvCh <-chan *client.Packet) {
 	klog.V(5).Infoln("start serving frontend stream")
 
@@ -576,7 +599,7 @@ func (s *ProxyServer) serveRecvFrontend(frontend *GrpcFrontend, recvCh <-chan *c
 		case client.PacketType_DIAL_REQ:
 			random := pkt.GetDialRequest().Random
 			address := pkt.GetDialRequest().Address
-			klog.V(3).InfoS("Received DIAL_REQ", "dialID", random, "dialAddress", address)
+			klog.V(3).InfoS("grpc frontend: Received DIAL_REQ", "dialID", random, "dialAddress", address)
 			// TODO: if we track what agent has historically served
 			// the address, then we can send the Dial_REQ to the
 			// same agent. That way we save the agent from creating
@@ -678,6 +701,33 @@ func (s *ProxyServer) serveRecvFrontend(frontend *GrpcFrontend, recvCh <-chan *c
 				s.sendFrontendClose(frontend, firstConnID, "mismatched connection IDs")
 				return
 			}
+
+			// obtain the connection for this data packet to enforce flow control
+			conn := s.getEstablishedConnection(backend.id, connID)
+			if conn != nil {
+				// FLOW CONTROL (throttle serve -> client)
+				//  - Non-blocking: check if we can acquire the semaphore -> if yes, returns true and aquires it.
+				if conn.flow != nil {
+					acquired := conn.flow.TryAcquire(1)
+					if !acquired {
+						start := time.Now()
+
+						klog.InfoS("Semaphore full, waiting for client receive window > 0", "start", start.String(), "agentID", backend.id, "connectionID", connID)
+						// Blocking: if semaphore is full (waits till server.go serveRecvBackend() - which receives packets via the grpc stream from an agent - receives
+						// an ACK packet which releases 1 from the semaphore.
+						conn.flow.Acquire(context.Background(), 1)
+						latency := time.Now().Sub(start)
+
+						klog.V(3).InfoS("Latency when waiting for client receive window > 0", "latency", latency.Milliseconds(), "start", start.String(), "agentID", backend.id, "connectionID", connID)
+					}
+
+				} else {
+					klog.InfoS("serveRecvFrontend: Semaphore IS NULL", "agentID", backend.id, "connectionID", connID)
+				}
+			} else {
+				klog.InfoS("serveRecvFrontend: couldn't find established connection", "agentID", backend.id, "connectionID", connID)
+			}
+
 			if err := backend.Send(pkt); err != nil {
 				// TODO: retry with other backends connecting to this agent.
 				klog.ErrorS(err, "DATA to Backend failed", "connectionID", connID)
@@ -873,6 +923,7 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 				"count", len(established), "agentID", agentID)
 		}
 
+		// this closes all frontend (kube-apiserver grpc/HTTpConnect) connections that are connected to this agent!
 		for _, frontend := range established {
 			pkt := &client.Packet{
 				Type: client.PacketType_CLOSE_RSP,
@@ -891,8 +942,10 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 		switch pkt.Type {
 		case client.PacketType_DIAL_RSP:
 			resp := pkt.GetDialResponse()
-			klog.V(5).InfoS("Received DIAL_RSP", "dialID", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID)
+			klog.V(4).InfoS("Received DIAL_RSP", "dialID", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID, "windowSize", resp.WindowSize)
 
+			// got a response for a dial to "open connection" (we already have a valid underlay grpc stream, this is just an "overlay connection" - representing a long lasting request)
+			// - the random number returned needs to match what we send in the DIAL_REQ, otherwise it's a rogue packet send through the agent (no idea to which frontendUniqueConnection to send to)
 			frontend := s.PendingDial.Remove(resp.Random)
 			if frontend == nil {
 				klog.V(2).InfoS("DIAL_RSP not recognized; dropped", "dialID", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID)
@@ -908,6 +961,17 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 					metrics.Metrics.ObserveDialFailure(metrics.DialFailureErrorResponse)
 					dialErr = true
 				}
+
+				klog.V(2).InfoS("PacketType_DIAL_RSP: init semaphore", "window_size", resp.WindowSize)
+				// init semaphore to control the window size on the server side (size is based on the window size communicated by the client)
+				if resp.WindowSize == 0 {
+					klog.V(2).InfoS("WARNING: window size defaulted", "window_size", resp.WindowSize)
+					resp.WindowSize = 10
+				}
+
+				frontend.flow = semaphore.NewWeighted(resp.WindowSize - 1)
+
+				// send the received packet to the designated fronted (IT SIMPLY PROXIES, lol)
 				err := frontend.send(pkt)
 				if err != nil {
 					klog.ErrorS(err, "DIAL_RSP send to frontend stream failure",
@@ -963,7 +1027,7 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 
 		case client.PacketType_DATA:
 			resp := pkt.GetData()
-			klog.V(5).InfoS("Received data from agent", "bytes", len(resp.Data), "agentID", agentID, "connectionID", resp.ConnectID)
+			klog.V(4).InfoS("Received data from agent", "bytes", len(resp.Data), "agentID", agentID, "connectionID", resp.ConnectID)
 			if resp.ConnectID == 0 {
 				klog.ErrorS(nil, "Received packet missing ConnectID from agent", "packetType", "DATA")
 				continue
@@ -981,6 +1045,21 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 				klog.V(5).InfoS("DATA sent to frontend")
 			}
 
+			// THROTTLING: server -> agent
+		case client.PacketType_DATA_ACK:
+			resp := pkt.GetDataAck()
+			klog.V(4).InfoS("Received data ACK from agent", "agentID", agentID, "connectionID", resp.ConnectID)
+			frontend, err := s.getFrontend(agentID, resp.ConnectID)
+			if err != nil {
+				klog.ErrorS(err, "could not get frontent client")
+				break
+			}
+
+			// the k-agent ACKed the receival of our previously sent DATA packed (client about to send it out to tenant endpoint in proxyToRemote)
+			// --> release 1 from semaphore, hence can acquire(1) in tunnel.go when sending DATA packet to k-agent
+			frontend.flow.Release(1)
+
+			// don't proxy to frontent (API Server), as the ACK from the agent is a control packet not meant for components outside of konnectivity
 		case client.PacketType_CLOSE_RSP:
 			resp := pkt.GetCloseResponse()
 			klog.V(5).InfoS("Received CLOSE_RSP", "agentID", agentID, "connectionID", resp.ConnectID)

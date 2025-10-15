@@ -379,6 +379,18 @@ func (a *Client) Serve() {
 				Type:    client.PacketType_DIAL_RSP,
 				Payload: &client.Packet_DialResponse{DialResponse: &client.DialResponse{}},
 			}
+
+			// inform the k-server about the window size to use for this connection
+			// - Window_SIZE: having the window size match the buffered receive channel size for this connection
+			//   kind of makes sense so that the server stops sending when the channel buffer e.dataCh
+			//   for this connection is full, hereby blocking the agents main receive loop on eConn.send(data.Data)
+			//   when receiving DAT_PACKET (what we want to avoid)
+			// - server inits a semaphore with this size and
+			//    - acquire(1) on send()
+			//    - release(1) on ACK from client
+			dialResp.GetDialResponse().WindowSize = int64(a.cs.xfrChannelSize)
+
+			// this is the random number set on the packet by the k-server, which expects it to be in the return response
 			dialResp.GetDialResponse().Random = dialReq.Random
 
 			connID := atomic.AddInt64(&a.nextConnID, 1)
@@ -490,7 +502,13 @@ func (a *Client) Serve() {
 
 			eConn, ok := a.connManager.Get(data.ConnectID)
 			if ok {
+				start := time.Now()
 				eConn.send(data.Data)
+				latency := time.Now().Sub(start)
+
+				if latency.Milliseconds() > 50 {
+					klog.V(3).InfoS("receive k-server loop blocked time", "latency", latency.Milliseconds(), "connectionID", data.ConnectID)
+				}
 			} else {
 				klog.V(2).InfoS("received DATA for unrecognized connection", "connectionID", data.ConnectID)
 				a.Send(&client.Packet{
@@ -551,7 +569,7 @@ func (a *Client) remoteToProxy(connID int64, eConn *endpointConn) {
 
 	for {
 		n, err := eConn.conn.Read(buf[:])
-		klog.V(5).InfoS("received data from remote", "bytes", n, "connectionID", connID)
+		klog.V(4).InfoS("received data from remote", "bytes", n, "connectionID", connID)
 
 		if err == io.EOF {
 			klog.V(2).InfoS("remote connection EOF", "connectionID", connID)
@@ -574,6 +592,7 @@ func (a *Client) remoteToProxy(connID int64, eConn *endpointConn) {
 		if err := a.Send(resp); err != nil {
 			klog.ErrorS(err, "could not send DATA", "connectionID", connID)
 		}
+		klog.V(4).InfoS("send data to server successfully", "bytes", n, "connectionID", connID)
 	}
 }
 
@@ -604,9 +623,35 @@ func (a *Client) proxyToRemote(connID int64, eConn *endpointConn) {
 	}()
 
 	for d := range eConn.dataCh {
+		// THROTTLING: k-server -> agent, by ACKing the current packet, so the server knows it can send another packet
+		// - How: send an ACK to the k-server, who will increase the window size again (release 1 from server's semaphore) allowing another packet to be sent in tunnel.go
+		// - we received the data packet from the server and are about to send it to the tenant endpoint
+		resp := &client.Packet{
+			Type: client.PacketType_DATA_ACK,
+		}
+		resp.Payload = &client.Packet_DataAck{DataAck: &client.DataAck{
+			ConnectID: connID,
+		}}
+		klog.V(4).InfoS("send DATA_ACK", "connectionID", connID)
+		if err := a.Send(resp); err != nil {
+			klog.ErrorS(err, "stream send ack failure")
+		}
+		klog.V(4).InfoS("send DATA_ACK SUCCESSFULLY", "connectionID", connID)
+
 		pos := 0
 		for {
+			// net.Conn.Write() in Go is a blocking call. It returns when one of the following occurs:
+			// - The data has been successfully written to the underlying operating system's kernel buffer.
+			// - An error occurs (e.g., the connection is closed or a timeout is exceeded).
+			// - The call is unblocked due to a timeout set by SetDeadline or SetWriteDeadline.
+			start := time.Now()
 			n, err := eConn.conn.Write(d[pos:])
+			latency := time.Now().Sub(start)
+
+			if latency.Milliseconds() > 50 {
+				klog.V(3).InfoS("conn.Write latency to OS buffer (agent->tenant)", "latency", latency.Milliseconds(), "connectionID", connID)
+			}
+
 			if err == nil {
 				klog.V(4).InfoS("write to remote", "connectionID", connID, "lastData", n, "dataSize", len(d))
 				break
