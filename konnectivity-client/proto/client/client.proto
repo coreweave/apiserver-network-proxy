@@ -31,6 +31,7 @@ enum PacketType {
   DATA = 4;
   DIAL_CLS = 5;
   DRAIN = 6;
+  DATA_ACK = 7;
 }
 
 message Packet {
@@ -44,6 +45,7 @@ message Packet {
     CloseResponse closeResponse = 6;
     CloseDial closeDial = 7;
     Drain drain = 8;
+    DataAck dataAck = 9;
   }
 }
 
@@ -56,6 +58,11 @@ message DialRequest {
 
     // random id for client, maybe should be longer
     int64 random = 3;
+
+    // TODO: currently not used, as for throttling agent -> server
+    // - added by server to inform agent
+    // window size for flow control
+    int64 windowSize = 4;
 }
 
 message DialResponse {
@@ -67,11 +74,21 @@ message DialResponse {
 
     // random copied from DialRequest
     int64 random = 3;
+
+    // window size for flow control
+   // - this is how the agent informs the sender about the capacity of it's receive window (impl. via semaphore of the same size)
+    int64 windowSize = 4;
 }
 
 message CloseRequest {
     // connectID of the stream to close
     int64 connectID = 1;
+}
+
+// ACK message usable for both directions
+message DataAck {
+  // connectID to connect to
+  int64 connectID = 1;
 }
 
 message CloseResponse {

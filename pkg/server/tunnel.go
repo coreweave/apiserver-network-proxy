@@ -17,6 +17,7 @@ limitations under the License.
 package server
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"math/rand"
@@ -170,11 +171,35 @@ func (t *Tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				},
 			},
 		}
+
+		// FLOW CONTROL (throttle serve -> client)
+		//  - Non-blocking: check if we can acquire the semaphore -> if yes, returns true and aquires it.
+		if connection.flow != nil {
+			acquired := connection.flow.TryAcquire(1)
+			if !acquired {
+				start := time.Now()
+
+				klog.InfoS("Semaphore full, waiting for client receive window > 0", "start", start.String(), "host", r.Host, "agentID", agentID, "connectionID", connID)
+				// Blocking: if semaphore is full (waits till server.go serveRecvBackend() - which receives packets via the grpc stream from an agent - receives
+				// an ACK packet which releases 1 from the semaphore.
+				connection.flow.Acquire(context.Background(), 1)
+				latency := time.Now().Sub(start)
+
+				klog.V(3).InfoS("Latency when waiting for client receive window > 0", "latency", latency.Milliseconds(), "start", start.String(), "host", r.Host, "agentID", agentID, "connectionID", connID)
+			}
+
+		} else {
+			klog.InfoS("Semaphore IS NULL", "host", r.Host, "agentID", agentID, "connectionID", connID)
+		}
+
+		// send packet to k-agent
+		// - NOTE: response packets from k-agent will asynchronously be received in serveRecvBackend() which then calls .send() using the http writer for the frontend/kubeAPIServer
 		err = backend.Send(packet)
 		if err != nil {
 			klog.ErrorS(err, "error sending packet")
 			break
 		}
+
 		klog.V(5).InfoS("Forwarding data on tunnel to agent",
 			"bytes", n,
 			"totalBytes", acc,
