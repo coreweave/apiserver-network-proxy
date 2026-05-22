@@ -577,8 +577,15 @@ func (a *Client) remoteToProxy(connID int64, eConn *endpointConn) {
 			Data:      buf[:n],
 			ConnectID: connID,
 		}}
+
+		klog.V(4).InfoS("sending data to kube-apiserver", "bytes", n, "connectionID", connID)
+		sendStart := time.Now()
 		if err := a.Send(resp); err != nil {
 			klog.ErrorS(err, "could not send DATA", "connectionID", connID)
+		}
+		sendLatency := time.Since(sendStart)
+		if sendLatency > 10*time.Millisecond {
+			klog.V(3).InfoS("slow send to kube-apiserver", "latency", sendLatency, "bytes", n, "connectionID", connID)
 		}
 		klog.V(4).InfoS("send data to server successfully", "bytes", n, "connectionID", connID)
 	}

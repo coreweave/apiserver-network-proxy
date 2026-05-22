@@ -54,6 +54,7 @@ type ServerMetrics struct {
 	pendingDials         *prometheus.GaugeVec
 	establishedConns     *prometheus.GaugeVec
 	fullRecvChannels     *prometheus.GaugeVec
+	fullRecvChannelWaits *prometheus.HistogramVec
 	dialFailures         *prometheus.CounterVec
 	streamPackets        *prometheus.CounterVec
 	streamErrors         *prometheus.CounterVec
@@ -143,6 +144,18 @@ func newServerMetrics() *ServerMetrics {
 			"service_method",
 		},
 	)
+	fullRecvChannelWaits := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: Namespace,
+			Subsystem: Subsystem,
+			Name:      "full_receive_channel_wait_seconds",
+			Help:      "Time spent blocked on a full receive channel before the send completed, partitioned by service method.",
+			Buckets:   latencyBuckets,
+		},
+		[]string{
+			"service_method",
+		},
+	)
 	dialFailures := prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: Namespace,
@@ -206,6 +219,7 @@ func newServerMetrics() *ServerMetrics {
 	prometheus.MustRegister(pendingDials)
 	prometheus.MustRegister(establishedConns)
 	prometheus.MustRegister(fullRecvChannels)
+	prometheus.MustRegister(fullRecvChannelWaits)
 	prometheus.MustRegister(dialFailures)
 	prometheus.MustRegister(streamPackets)
 	prometheus.MustRegister(streamErrors)
@@ -223,6 +237,7 @@ func newServerMetrics() *ServerMetrics {
 		pendingDials:         pendingDials,
 		establishedConns:     establishedConns,
 		fullRecvChannels:     fullRecvChannels,
+		fullRecvChannelWaits: fullRecvChannelWaits,
 		dialFailures:         dialFailures,
 		streamPackets:        streamPackets,
 		streamErrors:         streamErrors,
@@ -243,6 +258,7 @@ func (s *ServerMetrics) Reset() {
 	s.pendingDials.Reset()
 	s.establishedConns.Reset()
 	s.fullRecvChannels.Reset()
+	s.fullRecvChannelWaits.Reset()
 	s.dialFailures.Reset()
 	s.streamPackets.Reset()
 	s.streamErrors.Reset()
@@ -297,6 +313,11 @@ func (s *ServerMetrics) SetEstablishedConnCount(count int) {
 // FullRecvChannel retrieves the metric for counting full receive channels.
 func (s *ServerMetrics) FullRecvChannel(serviceMethod string) prometheus.Gauge {
 	return s.fullRecvChannels.With(prometheus.Labels{"service_method": serviceMethod})
+}
+
+// ObserveFullRecvChannelWait records how long a send blocked on a full receive channel.
+func (s *ServerMetrics) ObserveFullRecvChannelWait(serviceMethod string, elapsed time.Duration) {
+	s.fullRecvChannelWaits.With(prometheus.Labels{"service_method": serviceMethod}).Observe(elapsed.Seconds())
 }
 
 type DialFailureReason string
