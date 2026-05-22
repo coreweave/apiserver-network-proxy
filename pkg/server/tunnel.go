@@ -159,6 +159,8 @@ func (t *Tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			klog.ErrorS(err, "Received failure on connection")
+			// Likely cause: Kube-apiserver already terminated the connection with k-server.
+			klog.V(4).InfoS("Received failure on connection: frontent likely closed connection", "err", err.Error(), "host", r.Host, "agentID", agentID, "connectionID", connID)
 			break
 		}
 
@@ -179,13 +181,15 @@ func (t *Tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !acquired {
 				start := time.Now()
 
-				klog.InfoS("Semaphore full, waiting for client receive window > 0", "start", start.String(), "host", r.Host, "agentID", agentID, "connectionID", connID)
+				klog.V(4).InfoS("Semaphore full, waiting for client receive window > 0", "start", start.String(), "host", r.Host, "agentID", agentID, "connectionID", connID)
 				// Blocking: if semaphore is full (waits till server.go serveRecvBackend() - which receives packets via the grpc stream from an agent - receives
 				// an ACK packet which releases 1 from the semaphore.
 				connection.flow.Acquire(context.Background(), 1)
 				latency := time.Now().Sub(start)
 
-				klog.V(3).InfoS("Latency when waiting for client receive window > 0", "latency", latency.Milliseconds(), "start", start.String(), "host", r.Host, "agentID", agentID, "connectionID", connID)
+				if latency > time.Millisecond {
+					klog.V(2).InfoS("Latency when waiting for client receive window > 0", "latency", latency.Milliseconds(), "start", start.String(), "host", r.Host, "agentID", agentID, "connectionID", connID)
+				}
 			}
 
 		} else {

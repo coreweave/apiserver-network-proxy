@@ -497,7 +497,9 @@ func (s *ProxyServer) readFrontendToChannel(frontend *GrpcFrontend, userAgent []
 			klog.V(2).InfoS("Receive channel from frontend is full", "userAgent", userAgent)
 			fullRecvChannelMetric := metrics.Metrics.FullRecvChannel(metrics.Proxy)
 			fullRecvChannelMetric.Inc()
+			start := time.Now()
 			recvCh <- in
+			metrics.Metrics.ObserveFullRecvChannelWait(metrics.Proxy, time.Since(start))
 			fullRecvChannelMetric.Dec()
 		}
 	}
@@ -833,7 +835,11 @@ func (s *ProxyServer) readBackendToChannel(backend *Backend, recvCh chan *client
 			klog.V(2).InfoS("Receive channel from agent is full", "agentID", agentID)
 			fullRecvChannelMetric := metrics.Metrics.FullRecvChannel(metrics.Connect)
 			fullRecvChannelMetric.Inc()
+			start := time.Now()
 			recvCh <- in
+			latency := time.Since(start)
+			metrics.Metrics.ObserveFullRecvChannelWait(metrics.Connect, latency)
+			klog.V(2).InfoS("Latency: Receive channel from agent is full", "agentID", agentID, "latency", latency.Milliseconds())
 			fullRecvChannelMetric.Dec()
 		}
 	}
@@ -982,7 +988,8 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 				break
 			}
 			if err := frontend.send(pkt); err != nil {
-				klog.ErrorS(err, "send to client stream failure", "agentID", agentID, "connectionID", resp.ConnectID)
+				// Likely cause: Kube-apiserver already terminated the connection with k-server.
+				klog.V(4).InfoS("send to client stream failure (receiving DATA)", "err", err.Error(), "agentID", agentID, "connectionID", resp.ConnectID)
 			} else {
 				klog.V(5).InfoS("DATA sent to frontend")
 			}
@@ -993,7 +1000,8 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 			klog.V(4).InfoS("Received data ACK from agent", "agentID", agentID, "connectionID", resp.ConnectID)
 			frontend, err := s.getFrontend(agentID, resp.ConnectID)
 			if err != nil {
-				klog.ErrorS(err, "could not get frontent client")
+				// Likely cause: Kube-apiserver already terminated the connection with k-server.
+				klog.V(4).InfoS("could not get frontend client (receiving DATA_ACK)", "err", err.Error(), "agentID", agentID, "connectionID", resp.ConnectID)
 				break
 			}
 
