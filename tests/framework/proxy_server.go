@@ -39,6 +39,9 @@ type ProxyServerOpts struct {
 	ServerCount int
 	Mode        string
 	AgentPort   int // Defaults to random port.
+	// BackendDialTimeout bounds DIAL_REQ sends to and DIAL_RSP waits from
+	// backend agents. Zero (the default) disables the timeout.
+	BackendDialTimeout time.Duration
 }
 
 type ProxyServerRunner interface {
@@ -141,9 +144,12 @@ func serverOptions(t testing.TB, opts ProxyServerOpts) (*serveropts.ProxyRunOpti
 
 	o.ServerCount = opts.ServerCount
 	o.Mode = opts.Mode
+	o.BackendDialTimeout = opts.BackendDialTimeout
 
-	uid := uuid.New().String()
-	o.UdsName = filepath.Join(CertsDir, fmt.Sprintf("server-%s.sock", uid))
+	// Keep the socket name short: unix socket paths are limited to ~104
+	// bytes on darwin, and CertsDir already sits deep under TMPDIR.
+	uid := uuid.New().String()[:8]
+	o.UdsName = filepath.Join(CertsDir, fmt.Sprintf("s-%s.sock", uid))
 	o.ServerPort = 0 // Required for UDS
 
 	o.ClusterCert = filepath.Join(CertsDir, TestServerCertFile)
