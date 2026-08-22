@@ -72,7 +72,7 @@ import (
 // the server no longer registers it as a valid backend, a Watchdog probe to
 // its kubelet just hits the healthy agent: the destHost proxy strategy is
 // what lets the Watchdog target a specific agent, but the wedged backend no
-// longer exists in the server, so the probe falls back to the default
+// longer exists in the server, so the probe falls back to the default (random)
 // strategy. So this agent doesn't heal until it's unblocked or manually
 // rolled.
 //
